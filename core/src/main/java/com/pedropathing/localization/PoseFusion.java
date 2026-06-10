@@ -33,6 +33,7 @@ public class PoseFusion {
     // allocates nothing; callers read primitives via getX()/getY()/getHeading().
     private double curX, curY, curH;
     private double lastOdomX, lastOdomY, lastOdomH;
+    private long lastOdomNanos;
     private boolean hasLastOdom;
 
     private Mat3 P; //State Covariance
@@ -40,6 +41,16 @@ public class PoseFusion {
     private final Mat3 R; //Measurement Noise Covariance
     private final History history;
     private final int bufferSize;
+
+    // Glitch-guard magnitude bounds (host-specific units). Default = off (infinite); enable via
+    // setGlitchBounds(). Non-finite increments are rejected regardless of this setting.
+    private double maxLinearVel = Double.POSITIVE_INFINITY;
+    private double maxAngularVel = Double.POSITIVE_INFINITY;
+
+    // Diagnostics counters.
+    private long rejectedSamples;       // odometry readings/increments dropped as non-finite
+    private long clampedSamples;        // odometry increments clamped to the plausible-motion bound
+    private long rejectedMeasurements;  // vision measurements ignored (out of window or singular S)
 
     /** Reusable [x, y, heading] output buffer for the SE(2) helpers and history interpolation reads. */
     private final double[] pose = new double[3];
@@ -72,9 +83,17 @@ public class PoseFusion {
      * accumulate odometry into an absolute pose ({@code getPose()}), so this is the entry point for both.
      */
     public void predict(double odomX, double odomY, double odomH, long t) {
+        // Sanitize: a non-finite odometry reading must never enter history or poison later deltas;
+        // substitute the last good pose (zero motion this step) and count it.
+        if (!(Double.isFinite(odomX) && Double.isFinite(odomY) && Double.isFinite(odomH))) {
+            rejectedSamples++;
+            if (hasLastOdom) { odomX = lastOdomX; odomY = lastOdomY; odomH = lastOdomH; }
+            else { odomX = curX; odomY = curY; odomH = curH; }
+        }
         double dx = 0, dy = 0, dh = 0;
         if (hasLastOdom) {
             relativeTransform(lastOdomX, lastOdomY, lastOdomH, odomX, odomY, odomH, pose);
+            guardIncrement(pose, (t - lastOdomNanos) / 1e9, true);
             dx = pose[0]; dy = pose[1]; dh = pose[2];
         }
         applyIncrement(dx, dy, dh, odomX, odomY, odomH, t);
@@ -89,6 +108,7 @@ public class PoseFusion {
         curX = pose[0]; curY = pose[1]; curH = pose[2];
 
         lastOdomX = odomX; lastOdomY = odomY; lastOdomH = odomH;
+        lastOdomNanos = t;
         hasLastOdom = true;
 
         history.append(t, curX, curY, curH, odomX, odomY, odomH, P.copy());
@@ -119,8 +139,10 @@ public class PoseFusion {
             measurementR.set(i, i, Math.max(measurementR.get(i, i), MEASUREMENT_VARIANCE_FLOOR));
 
         // Reject if timestamp is outside our history time window
-        if (history.isEmpty() || t < history.firstTime() || t > history.lastTime())
+        if (history.isEmpty() || t < history.firstTime() || t > history.lastTime()) {
+            rejectedMeasurements++;
             return;
+        }
 
         // Fused pose at the measurement time
         double pastX, pastY, pastH;
@@ -149,6 +171,7 @@ public class PoseFusion {
         try {
             K = Pm.multiply(S.inverse());
         } catch (IllegalArgumentException | IllegalStateException e) {
+            rejectedMeasurements++;
             return;
         }
 
@@ -167,7 +190,7 @@ public class PoseFusion {
         Mat3 updatedCovariance =
                 IK.multiply(Pm).multiply(IK.transposed())
                         .plus(K.multiply(measurementR).multiply(K.transposed()));
-        floorCovariance(updatedCovariance);
+        hygiene(updatedCovariance);
 
         // Insert (or overwrite) the corrected sample at the measurement time. The odometry pose at
         // that time is interpolated so every sample carries a full (fused, odom, covariance) row.
@@ -183,13 +206,17 @@ public class PoseFusion {
         double prevOX = odomX, prevOY = odomY, prevOH = odomH;
         boolean prevHaveOdom = haveOdom;
         Mat3 prevCov = updatedCovariance;
+        long prevTime = t;
 
         for (int i = history.floorIndex(t) + 1; i < history.size(); i++) {
+            long currTime = history.timeAt(i);
             double currOX = history.odomXAt(i), currOY = history.odomYAt(i), currOH = history.odomHAt(i);
 
             double incX = 0, incY = 0, incH = 0;
             if (prevHaveOdom) {
                 relativeTransform(prevOX, prevOY, prevOH, currOX, currOY, currOH, pose);
+                // count=false: these increments were already tallied on the live predict path.
+                guardIncrement(pose, (currTime - prevTime) / 1e9, false);
                 incX = pose[0]; incY = pose[1]; incH = pose[2];
             }
 
@@ -205,6 +232,7 @@ public class PoseFusion {
             prevX = nextX; prevY = nextY; prevH = nextH;
             prevOX = currOX; prevOY = currOY; prevOH = currOH; prevHaveOdom = true;
             prevCov = nextCov;
+            prevTime = currTime;
         }
 
         curX = history.lastFusedX();
@@ -224,6 +252,7 @@ public class PoseFusion {
     public void reset(double x, double y, double h, long t) {
         curX = x; curY = y; curH = h;
         lastOdomX = x; lastOdomY = y; lastOdomH = h;
+        lastOdomNanos = t;
         hasLastOdom = true;
         history.clear();
         history.put(t, x, y, h, x, y, h, P.copy());
@@ -236,6 +265,7 @@ public class PoseFusion {
     public void setPose(double x, double y, double h) {
         curX = x; curY = y; curH = h;
         lastOdomX = x; lastOdomY = y; lastOdomH = h;
+        lastOdomNanos = history.isEmpty() ? 0L : history.lastTime();
         hasLastOdom = true;
         if (history.isEmpty()) {
             history.put(0L, x, y, h, x, y, h, P.copy());
@@ -262,6 +292,29 @@ public class PoseFusion {
     public boolean isNaN() {
         return Double.isNaN(curX) || Double.isNaN(curY) || Double.isNaN(curH);
     }
+
+    /**
+     * Enables the glitch guard's magnitude clamp with host-specific bounds (e.g. inches/s and rad/s):
+     * any odometry increment exceeding {@code maxLinearVel·dt} (translation, direction preserved) or
+     * {@code maxAngularVel·dt} (heading) is clamped to the bound. Off by default — the core can't know
+     * the host's units. Non-finite increments are always rejected regardless of this setting.
+     */
+    public void setGlitchBounds(double maxLinearVel, double maxAngularVel) {
+        this.maxLinearVel = maxLinearVel;
+        this.maxAngularVel = maxAngularVel;
+    }
+
+    /** Count of odometry readings/increments dropped because they were non-finite. */
+    public long getRejectedSamples() { return rejectedSamples; }
+
+    /** Count of odometry increments clamped because they exceeded the plausible-motion bound. */
+    public long getClampedSamples() { return clampedSamples; }
+
+    /** Count of vision measurements ignored (outside the buffer window, or a singular innovation). */
+    public long getRejectedMeasurements() { return rejectedMeasurements; }
+
+    /** Trace of the state covariance (x + y + heading variance) — a rough "how unsure am I" scalar. */
+    public double getCovarianceTrace() { return P.get(0, 0) + P.get(1, 1) + P.get(2, 2); }
 
     /**
      * Writes the SE(2) body-frame increment that takes pose {@code from} to pose {@code to}
@@ -382,17 +435,57 @@ public class PoseFusion {
         target.set(1, 1, target.get(1, 1) + d11);
         target.set(2, 2, target.get(2, 2) + qh);
 
-        floorCovariance(target);
+        hygiene(target);
     }
 
     /**
-     * Raises any covariance diagonal entry below {@link #MIN_COVARIANCE} up to that floor, in place.
-     * Only ever increases a diagonal, so P stays symmetric positive-definite and the filter can't
-     * become so confident on an axis that it stops responding to new measurements.
+     * Covariance hygiene, in place: re-symmetrize (the Joseph form and rotations drift slightly
+     * asymmetric over a long run) and floor each diagonal entry to {@link #MIN_COVARIANCE}. The floor
+     * only ever raises a diagonal, so P stays symmetric positive-definite and no axis collapses to a
+     * gain of zero (which would ignore vision on that axis forever).
      */
-    private static void floorCovariance(Mat3 m) {
+    private static void hygiene(Mat3 m) {
+        double xy = 0.5 * (m.get(0, 1) + m.get(1, 0)); m.set(0, 1, xy); m.set(1, 0, xy);
+        double xh = 0.5 * (m.get(0, 2) + m.get(2, 0)); m.set(0, 2, xh); m.set(2, 0, xh);
+        double yh = 0.5 * (m.get(1, 2) + m.get(2, 1)); m.set(1, 2, yh); m.set(2, 1, yh);
         for (int i = 0; i < 3; i++)
             if (m.get(i, i) < MIN_COVARIANCE) m.set(i, i, MIN_COVARIANCE);
+    }
+
+    /**
+     * Glitch guard, applied in place to a body-frame increment {@code inc = [Δx, Δy, Δθ]}. A
+     * non-finite increment is always zeroed (and counted when {@code count}); additionally, if a
+     * magnitude bound was set via {@link #setGlitchBounds}, a step exceeding {@code maxLinearVel·dt}
+     * (translation, direction preserved) or {@code maxAngularVel·dt} (heading) is clamped. The
+     * {@code dt}-scaled bound is loop-rate independent; {@code dt <= 0} under an active bound yields
+     * no motion.
+     *
+     * @param count whether to tally into the diagnostic counters — true on the live predict path,
+     *              false during measurement replay (which re-walks already-counted increments).
+     */
+    private void guardIncrement(double[] inc, double dt, boolean count) {
+        if (!Double.isFinite(inc[0]) || !Double.isFinite(inc[1]) || !Double.isFinite(inc[2])) {
+            if (count) rejectedSamples++;
+            inc[0] = 0; inc[1] = 0; inc[2] = 0;
+            return;
+        }
+        if (Double.isInfinite(maxLinearVel) && Double.isInfinite(maxAngularVel)) return; // guard off
+        if (dt <= 0) { inc[0] = 0; inc[1] = 0; inc[2] = 0; return; }
+
+        boolean clamped = false;
+        double maxLin = maxLinearVel * dt;
+        double norm = Math.hypot(inc[0], inc[1]);
+        if (norm > maxLin && norm > 0) {
+            double s = maxLin / norm;
+            inc[0] *= s; inc[1] *= s;
+            clamped = true;
+        }
+        double maxAng = maxAngularVel * dt;
+        if (Math.abs(inc[2]) > maxAng) {
+            inc[2] = Math.copySign(maxAng, inc[2]);
+            clamped = true;
+        }
+        if (clamped && count) clampedSamples++;
     }
 
     /** Wraps an angle to {@code [0, 2π)}. */
@@ -461,7 +554,7 @@ public class PoseFusion {
             return new Mat3(r);
         }
 
-        /** @throws IllegalArgumentException if singular, so callers' existing catch handles it. */
+        /** @throws IllegalArgumentException if singular/ill-conditioned, so callers' existing catch handles it. */
         Mat3 inverse() {
             double a = m[0], b = m[1], c = m[2];
             double d = m[3], e = m[4], f = m[5];
@@ -470,7 +563,13 @@ public class PoseFusion {
             double B = f * g - d * i;
             double C = d * h - e * g;
             double det = a * A + b * B + c * C;
-            if (det == 0.0) throw new IllegalArgumentException("Mat3 not invertible");
+            // Relative conditioning check: a 3×3 determinant scales with the cube of the entry
+            // magnitude, so compare against the matrix scale, not an absolute epsilon.
+            double scale = 0;
+            for (double v : m) scale = Math.max(scale, Math.abs(v));
+            if (scale == 0) scale = 1.0;
+            if (!Double.isFinite(det) || Math.abs(det) < 1e-9 * scale * scale * scale)
+                throw new IllegalArgumentException("Mat3 singular or ill-conditioned");
             double inv = 1.0 / det;
             double[] r = new double[9];
             r[0] = A * inv;             r[1] = (c * h - b * i) * inv; r[2] = (b * f - c * e) * inv;

@@ -288,4 +288,54 @@ class PoseFusionTest {
         assertTrue(moved > 0.5, "feeding the off-arc chord point should perturb the fused pose");
     }
 
+    // ---- glitch guard & diagnostics ---------------------------------------------------------
+
+    /** A non-finite odometry reading is rejected (always on, unit-free): the estimate holds and it's counted. */
+    @Test
+    void nonFiniteOdometry_isRejectedAndHeld() {
+        PoseFusion f = fusion(xyh(1, 1, 1), xyh(1, 1, 1), xyh(1, 1, 1));
+        f.predict(3, 4, 0, 1);
+        assertPose(f, 3, 4, 0, 1e-9);
+
+        f.predict(Double.NaN, 4, 0, 2);              // garbage sample
+        assertPose(f, 3, 4, 0, 1e-9);                 // estimate unchanged
+        assertEquals(1, f.getRejectedSamples());
+
+        f.predict(5, 4, 0, 3);                        // recovers cleanly afterward
+        assertPose(f, 5, 4, 0, 1e-9);
+    }
+
+    /** With bounds set, an implausibly large odometry step is clamped to maxLinearVel·dt and counted. */
+    @Test
+    void glitchGuard_clampsImplausibleStep() {
+        long ms = 1_000_000L;
+        PoseFusion f = fusion(xyh(1, 1, 1), xyh(0.01, 0.01, 0.01), xyh(1, 1, 1));
+        f.setGlitchBounds(80, Math.toRadians(720));   // 80 in/s, 720 deg/s
+
+        f.predict(0.5, 0, 0, 10 * ms);                // 50 in/s over 10 ms — within bounds
+        assertPose(f, 0.5, 0, 0, 1e-9);
+
+        f.predict(50, 0, 0, 20 * ms);                 // ~4950 in/s — clamped to 80*0.01 = 0.8 in
+        assertEquals(1.3, f.getX(), 1e-9, "step clamped to maxLinearVel*dt = 0.8\" on top of 0.5\"");
+        assertEquals(1, f.getClampedSamples());
+    }
+
+    /** Off by default: the same implausible step passes through unclamped when no bounds are set. */
+    @Test
+    void glitchGuard_offByDefault() {
+        long ms = 1_000_000L;
+        PoseFusion f = fusion(xyh(1, 1, 1), xyh(0.01, 0.01, 0.01), xyh(1, 1, 1));
+        f.predict(50, 0, 0, 10 * ms);
+        assertPose(f, 50, 0, 0, 1e-9);
+        assertEquals(0, f.getClampedSamples());
+    }
+
+    /** A measurement outside the buffer window is counted as rejected. */
+    @Test
+    void rejectedMeasurements_areCounted() {
+        PoseFusion f = fusion(xyh(1, 1, 1), xyh(1, 1, 1), xyh(1, 1, 1));
+        f.predict(2, 0, 0, 10);
+        f.correct(100, 100, 1, -5, 1, 1, 1);          // before the window
+        assertEquals(1, f.getRejectedMeasurements());
+    }
 }

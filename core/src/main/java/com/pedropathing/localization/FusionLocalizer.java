@@ -78,6 +78,27 @@ public class FusionLocalizer implements Localizer {
         }
     }
 
+    /**
+     * Enables the odometry glitch guard's magnitude clamp (off by default). Bounds are in the
+     * localizer's units — typically inches/second and radians/second. Non-finite odometry samples are
+     * always rejected regardless of this setting.
+     */
+    public void setGlitchBounds(double maxLinearVel, double maxAngularVel) {
+        core.setGlitchBounds(maxLinearVel, maxAngularVel);
+    }
+
+    /** @see PoseFusion#getRejectedSamples() */
+    public long getRejectedSamples() { return core.getRejectedSamples(); }
+
+    /** @see PoseFusion#getClampedSamples() */
+    public long getClampedSamples() { return core.getClampedSamples(); }
+
+    /** @see PoseFusion#getRejectedMeasurements() */
+    public long getRejectedMeasurements() { return core.getRejectedMeasurements(); }
+
+    /** @see PoseFusion#getCovarianceTrace() */
+    public double getCovarianceTrace() { return core.getCovarianceTrace(); }
+
     @Override
     public Pose getPose() { return new Pose(core.getX(), core.getY(), core.getHeading()); }
 

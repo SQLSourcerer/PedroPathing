@@ -333,6 +333,76 @@ class FusionLocalizerTest {
         assertEquals(1.5, fused.getAngularVelocity(), 0);
     }
 
+    // ---- exp-map (geodesic) interpolation ---------------------------------------------------
+
+    /** SE(2) exponential map: the pose reached by flowing the body twist (vx, vy, w) for unit time. */
+    private static Pose expSE2(double vx, double vy, double w) {
+        if (Math.abs(w) < 1e-9) return new Pose(vx, vy, w);
+        double s = Math.sin(w) / w;
+        double c = (1 - Math.cos(w)) / w;
+        return new Pose(s * vx - c * vy, c * vx + s * vy, w);
+    }
+
+    /** SE(2) composition a ⊕ b: applies body increment {@code b} at pose {@code a}. */
+    private static Pose composePose(Pose a, Pose b) {
+        double cos = Math.cos(a.getHeading()), sin = Math.sin(a.getHeading());
+        return new Pose(
+                a.getX() + b.getX() * cos - b.getY() * sin,
+                a.getY() + b.getX() * sin + b.getY() * cos,
+                a.getHeading() + b.getHeading());
+    }
+
+    /**
+     * A measurement timestamped mid-arc must be compared against the pose on the arc the robot
+     * actually drove, not the straight chord between the two bracketing samples. Each odometry step
+     * here is one constant body twist (forward while turning), so the exact mid-arc pose is known in
+     * closed form. Feeding that pose as a fully-trusted measurement at the midpoint timestamp is a
+     * no-op (zero residual) only if the history interpolates geodesically; a plain component lerp
+     * would land on the chord, see a nonzero residual, and shove the fused pose off {@code p2}.
+     */
+    @Test
+    void measurementMidArc_interpolatesAlongArcNotChord() {
+        // One constant body twist per step: 10" forward while turning +60 degrees.
+        Pose fullStep = expSE2(10, 0, Math.PI / 3);
+        Pose halfStep = expSE2(5, 0, Math.PI / 6);
+
+        Pose p1 = fullStep;                       // origin (0,0,0) ⊕ fullStep
+        Pose p2 = composePose(p1, fullStep);
+        Pose arcMid = composePose(p1, halfStep);  // true pose halfway (in twist) from p1 to p2
+        Pose chordMid = new Pose(                 // where a straight component lerp would land
+                (p1.getX() + p2.getX()) / 2,
+                (p1.getY() + p2.getY()) / 2,
+                arcMid.getHeading());             // heading is linear either way; only translation differs
+
+        // Sanity: the arc bows far enough off the chord that the two interpolations are distinguishable.
+        double arcChordGap = Math.hypot(arcMid.getX() - chordMid.getX(), arcMid.getY() - chordMid.getY());
+        assertTrue(arcChordGap > 1.0, "arc and chord must differ enough for the test to bite");
+
+        // Trusted vision (tiny variance) measuring the true mid-arc pose => zero residual => no-op.
+        FakeLocalizer odom = new FakeLocalizer();
+        TestableFusion fused = new TestableFusion(odom,
+                new Pose(1e6, 1e6, 1e6), new Pose(1, 1, 1), new Pose(EPS, EPS, EPS), 1000);
+        fused.setStartPose(new Pose(0, 0, 0));
+        step(fused, odom, 10, p1);
+        step(fused, odom, 20, p2);
+        assertPoseEquals(p2, fused.getPose(), 1e-9); // no vision yet: present is exactly p2
+
+        fused.addMeasurement(arcMid, 15, new Pose(EPS, EPS, EPS));
+        assertPoseEquals(p2, fused.getPose(), 1e-4); // geodesic interp => residual 0 => still p2
+
+        // Teeth: feeding the off-arc chord point at the same time is *not* a no-op, confirming the
+        // interpolation actually follows the arc (a linear interp would have made the arc case fail).
+        FakeLocalizer odom2 = new FakeLocalizer();
+        TestableFusion fused2 = new TestableFusion(odom2,
+                new Pose(1e6, 1e6, 1e6), new Pose(1, 1, 1), new Pose(EPS, EPS, EPS), 1000);
+        fused2.setStartPose(new Pose(0, 0, 0));
+        step(fused2, odom2, 10, p1);
+        step(fused2, odom2, 20, p2);
+        fused2.addMeasurement(chordMid, 15, new Pose(EPS, EPS, EPS));
+        double moved = Math.hypot(fused2.getPose().getX() - p2.getX(), fused2.getPose().getY() - p2.getY());
+        assertTrue(moved > 0.5, "feeding the off-arc chord point should perturb the fused pose");
+    }
+
     /** {@code isNAN} reflects the fused position. */
     @Test
     void isNAN_reflectsCurrentPosition() {

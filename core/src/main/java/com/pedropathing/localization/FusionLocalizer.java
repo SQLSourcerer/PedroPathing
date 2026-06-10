@@ -9,6 +9,12 @@ public class FusionLocalizer implements Localizer {
     /** Floor applied to per-axis measurement variance so a "fully trusted" (variance 0) axis can't
      * freeze that axis or make the innovation covariance S = Pm + R singular. */
     private static final double MEASUREMENT_VARIANCE_FLOOR = 1e-6;
+    /** Floor applied to each covariance diagonal entry after a process or measurement update, so a
+     * long run of vision corrections can't drive P toward zero (an overconfident filter that then
+     * ignores new vision). It only ever raises a diagonal entry — P + a non-negative diagonal stays
+     * positive-definite — and, being idempotent, leaves loop-rate invariance and a stationary robot's
+     * covariance untouched (the clamp is a no-op until an axis would actually collapse). */
+    private static final double MIN_COVARIANCE = 1e-6;
     /** History is kept for this wall-clock window (the acceptable vision-latency budget), making the
      * budget independent of loop rate; {@code bufferSize} additionally caps the entry count. */
     private static final long BUFFER_DURATION_NANOS = 1_000_000_000L;
@@ -190,6 +196,7 @@ public class FusionLocalizer implements Localizer {
         Matrix updatedCovariance =
                 IK.multiply(Pm).multiply(IK.transposed())
                         .plus(K.multiply(measurementR).multiply(K.transposed()));
+        floorCovariance(updatedCovariance);
 
         // Insert (or overwrite) the corrected sample at the measurement time. The odometry pose at
         // that time is interpolated so every sample carries a full (fused, odom, covariance) row.
@@ -265,6 +272,54 @@ public class FusionLocalizer implements Localizer {
     }
 
     /**
+     * Interpolates between SE(2) poses {@code a} and {@code b} along the constant-twist geodesic at
+     * {@code ratio} ∈ [0, 1], writing [x, y, heading] into {@code out}. This is {@code a ⊕ exp(ratio ·
+     * log(a⁻¹ ⊕ b))}: the relative motion is taken to the Lie-algebra twist, scaled, and mapped back,
+     * so the result follows the arc the robot drove between the two samples rather than the straight
+     * chord. Allocation-free; reduces to plain translation lerp as the heading change goes to zero.
+     */
+    private static void geodesicInterpolate(double ax, double ay, double ah,
+                                            double bx, double by, double bh,
+                                            double ratio, double[] out) {
+        double co = Math.cos(ah), si = Math.sin(ah);
+
+        // rel = a⁻¹ ⊕ b, the body-frame relative pose as an SE(2) group element.
+        double dx = bx - ax, dy = by - ay;
+        double rx = dx * co + dy * si;
+        double ry = -dx * si + dy * co;
+        double rth = MathFunctions.normalizeAngleSigned(bh - ah);
+
+        // log(rel): recover the body twist (ux, uy, rth) whose flow for unit time yields rel.
+        double ux, uy;
+        if (Math.abs(rth) < 1e-6) {
+            ux = rx; uy = ry;
+        } else {
+            double v = Math.sin(rth) / rth;
+            double w = (1 - Math.cos(rth)) / rth;
+            double denom = v * v + w * w;
+            ux = (v * rx + w * ry) / denom;
+            uy = (v * ry - w * rx) / denom;
+        }
+
+        // exp(ratio · twist): scale the twist and map back to a group increment.
+        double sth = ratio * rth, sx = ratio * ux, sy = ratio * uy;
+        double ix, iy;
+        if (Math.abs(sth) < 1e-6) {
+            ix = sx; iy = sy;
+        } else {
+            double v = Math.sin(sth) / sth;
+            double w = (1 - Math.cos(sth)) / sth;
+            ix = v * sx - w * sy;
+            iy = w * sx + v * sy;
+        }
+
+        // a ⊕ increment.
+        out[0] = ax + ix * co - iy * si;
+        out[1] = ay + ix * si + iy * co;
+        out[2] = MathFunctions.normalizeAngle(ah + sth);
+    }
+
+    /**
      * Adds the process-noise contribution G·Q·Gᵀ for one odometry increment directly into
      * {@code target} (a 3×3 covariance), allocating nothing.
      * <p>
@@ -309,6 +364,18 @@ public class FusionLocalizer implements Localizer {
         target.set(1, 0, target.get(1, 0) + d10);
         target.set(1, 1, target.get(1, 1) + d11);
         target.set(2, 2, target.get(2, 2) + qh);
+
+        floorCovariance(target);
+    }
+
+    /**
+     * Raises any covariance diagonal entry below {@link #MIN_COVARIANCE} up to that floor, in place.
+     * Only ever increases a diagonal, so P stays symmetric positive-definite and the filter can't
+     * become so confident on an axis that it stops responding to new measurements.
+     */
+    private static void floorCovariance(Matrix m) {
+        for (int i = 0; i < 3; i++)
+            if (m.get(i, i) < MIN_COVARIANCE) m.set(i, i, MIN_COVARIANCE);
     }
 
     @Override
@@ -483,7 +550,12 @@ public class FusionLocalizer implements Localizer {
         boolean interpolateFusedInto(long ts, double[] out) { return interpolate(fusedX, fusedY, fusedH, ts, out); }
         boolean interpolateOdomInto(long ts, double[] out) { return interpolate(odomX, odomY, odomH, ts, out); }
 
-        /** Linear interpolation of a pose column at {@code ts} into {@code out}; false if out of range. */
+        /**
+         * Interpolates a pose column at {@code ts} into {@code out}; false if out of range. Uses the
+         * SE(2) exponential map (constant-twist geodesic) rather than straight component lerp, so a
+         * sample taken mid-arc lands on the arc the robot actually drove, not on the chord — the
+         * error a plain lerp makes grows with the heading change across the bracketing samples.
+         */
         private boolean interpolate(double[] colX, double[] colY, double[] colH, long ts, double[] out) {
             int lo = floorIndex(ts);
             int hi = ceilingIndex(ts);
@@ -497,10 +569,8 @@ public class FusionLocalizer implements Localizer {
             int upper = arr(hi);
             double ratio = (double) (ts - time[lower]) / (time[upper] - time[lower]);
 
-            out[0] = colX[lower] + ratio * (colX[upper] - colX[lower]);
-            out[1] = colY[lower] + ratio * (colY[upper] - colY[lower]);
-            double headingDiff = MathFunctions.getSmallestAngleDifference(colH[upper], colH[lower]);
-            out[2] = MathFunctions.normalizeAngle(colH[lower] + ratio * headingDiff);
+            geodesicInterpolate(colX[lower], colY[lower], colH[lower],
+                    colX[upper], colY[upper], colH[upper], ratio, out);
             return true;
         }
 

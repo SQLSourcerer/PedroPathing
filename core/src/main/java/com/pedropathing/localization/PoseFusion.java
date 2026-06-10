@@ -1,8 +1,5 @@
 package com.pedropathing.localization;
 
-import com.pedropathing.math.MathFunctions;
-import com.pedropathing.math.Matrix;
-
 /**
  * Host-agnostic SE(2) pose estimator that fuses dead-reckoning odometry with absolute (e.g. vision)
  * measurements. This is pure math: it owns no clock and no sensor — callers push timestamped inputs
@@ -14,9 +11,9 @@ import com.pedropathing.math.Matrix;
  * </ul>
  * Out-of-order measurements are supported: {@code correct} rewinds to the measurement's timestamp
  * within a bounded history and re-propagates the odometry since then, making this a fixed-lag
- * smoother. All inputs and outputs are primitives, so the estimator depends only on {@link Matrix}
- * and {@link MathFunctions} — not on any pose/localizer type. Adapters (e.g. {@link FusionLocalizer}
- * for PedroPathing) wire it to a concrete localizer and clock.
+ * smoother. All inputs and outputs are primitives and the 3×3 linear algebra is a self-contained
+ * {@code Mat3}, so the estimator depends on nothing outside the JDK — no pose, matrix, or localizer
+ * type. Adapters (e.g. {@link FusionLocalizer} for PedroPathing) wire it to a concrete localizer and clock.
  */
 public class PoseFusion {
     /** Floor applied to per-axis measurement variance so a "fully trusted" (variance 0) axis can't
@@ -38,9 +35,9 @@ public class PoseFusion {
     private double lastOdomX, lastOdomY, lastOdomH;
     private boolean hasLastOdom;
 
-    private Matrix P; //State Covariance
-    private final Matrix Q; //Process Noise Covariance
-    private final Matrix R; //Measurement Noise Covariance
+    private Mat3 P; //State Covariance
+    private final Mat3 Q; //Process Noise Covariance
+    private final Mat3 R; //Measurement Noise Covariance
     private final History history;
     private final int bufferSize;
 
@@ -59,9 +56,9 @@ public class PoseFusion {
      *                            of the {@code BUFFER_DURATION_NANOS} wall-clock latency window)
      */
     public PoseFusion(double[] initialCovariance, double[] processVariance, double[] measurementVariance, int bufferSize) {
-        this.P = Matrix.diag(initialCovariance[0], initialCovariance[1], initialCovariance[2]);
-        this.Q = Matrix.diag(processVariance[0], processVariance[1], processVariance[2]);
-        this.R = Matrix.diag(measurementVariance[0], measurementVariance[1], measurementVariance[2]);
+        this.P = Mat3.diag(initialCovariance[0], initialCovariance[1], initialCovariance[2]);
+        this.Q = Mat3.diag(processVariance[0], processVariance[1], processVariance[2]);
+        this.R = Mat3.diag(measurementVariance[0], measurementVariance[1], measurementVariance[2]);
         this.bufferSize = bufferSize;
         this.history = new History(bufferSize);
     }
@@ -113,10 +110,10 @@ public class PoseFusion {
      * treated as unobserved and left uncorrected.
      */
     public void correct(double measX, double measY, double measH, long t, double varX, double varY, double varH) {
-        applyCorrection(measX, measY, measH, t, Matrix.diag(varX, varY, varH));
+        applyCorrection(measX, measY, measH, t, Mat3.diag(varX, varY, varH));
     }
 
-    private void applyCorrection(double measX, double measY, double measH, long t, Matrix measurementR) {
+    private void applyCorrection(double measX, double measY, double measH, long t, Mat3 measurementR) {
         // Floor variances so a "fully trusted" axis (variance 0) can't freeze the axis or make S singular.
         for (int i = 0; i < 3; i++)
             measurementR.set(i, i, Math.max(measurementR.get(i, i), MEASUREMENT_VARIANCE_FLOOR));
@@ -133,52 +130,41 @@ public class PoseFusion {
             pastX = curX; pastY = curY; pastH = curH;
         }
 
-        // Measurement residual y = z - x
+        // Measurement residual y = z - x (zero on unobserved axes)
         boolean useX = !Double.isNaN(measX);
         boolean useY = !Double.isNaN(measY);
         boolean useH = !Double.isNaN(measH);
-
-        Matrix y = new Matrix(new double[][]{
-                {useX ? measX - pastX : 0},
-                {useY ? measY - pastY : 0},
-                {useH ? MathFunctions.normalizeAngleSigned(measH - pastH) : 0}
-        });
-
-        // Measurement mask M
-        Matrix M = Matrix.diag(
-                useX ? 1 : 0,
-                useY ? 1 : 0,
-                useH ? 1 : 0
-        );
+        double yx = useX ? measX - pastX : 0;
+        double yy = useY ? measY - pastY : 0;
+        double yh = useH ? normalizeAngleSigned(measH - pastH) : 0;
 
         // Covariance at measurement time (floor entry: latest sample at or before the timestamp)
-        Matrix Pm = history.covAt(history.floorIndex(t));
+        Mat3 Pm = history.covAt(history.floorIndex(t));
 
         // Innovation covariance S = P + R
-        Matrix S = Pm.plus(measurementR);
+        Mat3 S = Pm.plus(measurementR);
 
-        // Apply gain K = P * (P + R)^(-1); skip (don't crash) if S is singular / ill-conditioned
-        Matrix K;
+        // Gain K = P * (P + R)^(-1); skip (don't crash) if S is singular / ill-conditioned
+        Mat3 K;
         try {
             K = Pm.multiply(S.inverse());
         } catch (IllegalArgumentException | IllegalStateException e) {
             return;
         }
 
-        // Apply mask
-        K = M.multiply(K);
-        y = M.multiply(y);
+        // Measurement mask: zero the rows of K for unobserved axes so those states are not updated.
+        if (!useX) { K.set(0, 0, 0); K.set(0, 1, 0); K.set(0, 2, 0); }
+        if (!useY) { K.set(1, 0, 0); K.set(1, 1, 0); K.set(1, 2, 0); }
+        if (!useH) { K.set(2, 0, 0); K.set(2, 1, 0); K.set(2, 2, 0); }
 
-        // State update
-        Matrix Ky = K.multiply(y);
-        double updX = pastX + Ky.get(0, 0);
-        double updY = pastY + Ky.get(1, 0);
-        double updH = MathFunctions.normalizeAngle(pastH + Ky.get(2, 0));
+        // State update x += K·y
+        double updX = pastX + K.get(0, 0) * yx + K.get(0, 1) * yy + K.get(0, 2) * yh;
+        double updY = pastY + K.get(1, 0) * yx + K.get(1, 1) * yy + K.get(1, 2) * yh;
+        double updH = normalizeAngle(pastH + K.get(2, 0) * yx + K.get(2, 1) * yy + K.get(2, 2) * yh);
 
-        // Joseph-form covariance update
-        Matrix I = Matrix.identity(3);
-        Matrix IK = I.minus(K);
-        Matrix updatedCovariance =
+        // Joseph-form covariance update: (I-K)·Pm·(I-K)ᵀ + K·R·Kᵀ
+        Mat3 IK = Mat3.identity().minus(K);
+        Mat3 updatedCovariance =
                 IK.multiply(Pm).multiply(IK.transposed())
                         .plus(K.multiply(measurementR).multiply(K.transposed()));
         floorCovariance(updatedCovariance);
@@ -196,7 +182,7 @@ public class PoseFusion {
         double prevX = updX, prevY = updY, prevH = updH;
         double prevOX = odomX, prevOY = odomY, prevOH = odomH;
         boolean prevHaveOdom = haveOdom;
-        Matrix prevCov = updatedCovariance;
+        Mat3 prevCov = updatedCovariance;
 
         for (int i = history.floorIndex(t) + 1; i < history.size(); i++) {
             double currOX = history.odomXAt(i), currOY = history.odomYAt(i), currOH = history.odomHAt(i);
@@ -212,7 +198,7 @@ public class PoseFusion {
             history.setFused(i, nextX, nextY, nextH);
 
             // Copy once (each stored row needs its own matrix), then accumulate noise in place.
-            Matrix nextCov = prevCov.copy();
+            Mat3 nextCov = prevCov.copy();
             addProcessNoiseInPlace(nextCov, incX, incY, incH, prevH);
             history.setCov(i, nextCov);
 
@@ -264,8 +250,14 @@ public class PoseFusion {
     public double getY() { return curY; }
     public double getHeading() { return curH; }
 
-    /** @return a copy of the current 3×3 state covariance. */
-    public Matrix getCovariance() { return P.copy(); }
+    /** @return a copy of the current 3×3 state covariance as a row-major {@code double[3][3]}. */
+    public double[][] getCovariance() {
+        return new double[][]{
+                {P.get(0, 0), P.get(0, 1), P.get(0, 2)},
+                {P.get(1, 0), P.get(1, 1), P.get(1, 2)},
+                {P.get(2, 0), P.get(2, 1), P.get(2, 2)},
+        };
+    }
 
     public boolean isNaN() {
         return Double.isNaN(curX) || Double.isNaN(curY) || Double.isNaN(curH);
@@ -281,7 +273,7 @@ public class PoseFusion {
         double dx = toX - fromX, dy = toY - fromY;
         out[0] = dx * co + dy * si;
         out[1] = -dx * si + dy * co;
-        out[2] = MathFunctions.normalizeAngleSigned(toH - fromH);
+        out[2] = normalizeAngleSigned(toH - fromH);
     }
 
     /**
@@ -293,7 +285,7 @@ public class PoseFusion {
         double co = Math.cos(baseH), si = Math.sin(baseH);
         out[0] = baseX + incX * co - incY * si;
         out[1] = baseY + incX * si + incY * co;
-        out[2] = MathFunctions.normalizeAngle(baseH + incH);
+        out[2] = normalizeAngle(baseH + incH);
     }
 
     /**
@@ -312,7 +304,7 @@ public class PoseFusion {
         double dx = bx - ax, dy = by - ay;
         double rx = dx * co + dy * si;
         double ry = -dx * si + dy * co;
-        double rth = MathFunctions.normalizeAngleSigned(bh - ah);
+        double rth = normalizeAngleSigned(bh - ah);
 
         // log(rel): recover the body twist (ux, uy, rth) whose flow for unit time yields rel.
         double ux, uy;
@@ -341,7 +333,7 @@ public class PoseFusion {
         // a ⊕ increment.
         out[0] = ax + ix * co - iy * si;
         out[1] = ay + ix * si + iy * co;
-        out[2] = MathFunctions.normalizeAngle(ah + sth);
+        out[2] = normalizeAngle(ah + sth);
     }
 
     /**
@@ -367,7 +359,7 @@ public class PoseFusion {
      * @param ih      body-frame increment Δθ
      * @param heading the fused heading the increment is applied at, rotating Q into the world frame
      */
-    private void addProcessNoiseInPlace(Matrix target, double ix, double iy, double ih, double heading) {
+    private void addProcessNoiseInPlace(Mat3 target, double ix, double iy, double ih, double heading) {
         double co = Math.cos(heading);
         double si = Math.sin(heading);
         double qx = Math.abs(ix) * Q.get(0, 0);
@@ -398,9 +390,94 @@ public class PoseFusion {
      * Only ever increases a diagonal, so P stays symmetric positive-definite and the filter can't
      * become so confident on an axis that it stops responding to new measurements.
      */
-    private static void floorCovariance(Matrix m) {
+    private static void floorCovariance(Mat3 m) {
         for (int i = 0; i < 3; i++)
             if (m.get(i, i) < MIN_COVARIANCE) m.set(i, i, MIN_COVARIANCE);
+    }
+
+    /** Wraps an angle to {@code [0, 2π)}. */
+    private static double normalizeAngle(double angle) {
+        angle %= 2 * Math.PI;
+        return angle < 0 ? angle + 2 * Math.PI : angle;
+    }
+
+    /** Wraps an angle to {@code [-π, π)}. */
+    private static double normalizeAngleSigned(double angle) {
+        angle = normalizeAngle(angle);
+        return angle >= Math.PI ? angle - 2 * Math.PI : angle;
+    }
+
+    /**
+     * Minimal self-contained 3×3 matrix (row-major, flat backing array) — just the operations the
+     * Kalman update needs, so the estimator carries no external linear-algebra dependency. Every op
+     * returns a fresh matrix except {@link #set}, which mutates in place.
+     */
+    private static final class Mat3 {
+        private final double[] m; // row-major: m[r*3 + c]
+
+        private Mat3(double[] m) { this.m = m; }
+
+        static Mat3 diag(double a, double b, double c) {
+            double[] m = new double[9];
+            m[0] = a; m[4] = b; m[8] = c;
+            return new Mat3(m);
+        }
+
+        static Mat3 identity() { return diag(1, 1, 1); }
+
+        double get(int r, int c) { return m[r * 3 + c]; }
+        void set(int r, int c, double v) { m[r * 3 + c] = v; }
+
+        Mat3 copy() { return new Mat3(m.clone()); }
+
+        Mat3 plus(Mat3 o) {
+            double[] r = new double[9];
+            for (int i = 0; i < 9; i++) r[i] = m[i] + o.m[i];
+            return new Mat3(r);
+        }
+
+        Mat3 minus(Mat3 o) {
+            double[] r = new double[9];
+            for (int i = 0; i < 9; i++) r[i] = m[i] - o.m[i];
+            return new Mat3(r);
+        }
+
+        Mat3 multiply(Mat3 o) {
+            double[] r = new double[9];
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++) {
+                    double s = 0;
+                    for (int k = 0; k < 3; k++) s += m[i * 3 + k] * o.m[k * 3 + j];
+                    r[i * 3 + j] = s;
+                }
+            return new Mat3(r);
+        }
+
+        Mat3 transposed() {
+            double[] r = new double[9];
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++)
+                    r[j * 3 + i] = m[i * 3 + j];
+            return new Mat3(r);
+        }
+
+        /** @throws IllegalArgumentException if singular, so callers' existing catch handles it. */
+        Mat3 inverse() {
+            double a = m[0], b = m[1], c = m[2];
+            double d = m[3], e = m[4], f = m[5];
+            double g = m[6], h = m[7], i = m[8];
+            double A = e * i - f * h;   // cofactors along the first row
+            double B = f * g - d * i;
+            double C = d * h - e * g;
+            double det = a * A + b * B + c * C;
+            if (det == 0.0) throw new IllegalArgumentException("Mat3 not invertible");
+            double inv = 1.0 / det;
+            double[] r = new double[9];
+            r[0] = A * inv;             r[1] = (c * h - b * i) * inv; r[2] = (b * f - c * e) * inv;
+            r[3] = B * inv;             r[4] = (a * i - c * g) * inv; r[5] = (c * d - a * f) * inv;
+            r[6] = C * inv;             r[7] = (b * g - a * h) * inv; r[8] = (a * e - b * d) * inv;
+            return new Mat3(r);
+        }
     }
 
     /**
@@ -415,7 +492,7 @@ public class PoseFusion {
         private final long[] time;
         private final double[] fusedX, fusedY, fusedH;
         private final double[] odomX, odomY, odomH;
-        private final Matrix[] cov;
+        private final Mat3[] cov;
         private final int capacity;
         private int head; // logical index 0 lives at array index `head`
         private int size;
@@ -427,7 +504,7 @@ public class PoseFusion {
             time = new long[capacity];
             fusedX = new double[capacity]; fusedY = new double[capacity]; fusedH = new double[capacity];
             odomX = new double[capacity]; odomY = new double[capacity]; odomH = new double[capacity];
-            cov = new Matrix[capacity];
+            cov = new Mat3[capacity];
         }
 
         boolean isEmpty() { return size == 0; }
@@ -438,15 +515,15 @@ public class PoseFusion {
         double odomXAt(int i) { return odomX[arr(i)]; }
         double odomYAt(int i) { return odomY[arr(i)]; }
         double odomHAt(int i) { return odomH[arr(i)]; }
-        Matrix covAt(int i) { return cov[arr(i)]; }
+        Mat3 covAt(int i) { return cov[arr(i)]; }
         double lastFusedX() { return fusedX[arr(size - 1)]; }
         double lastFusedY() { return fusedY[arr(size - 1)]; }
         double lastFusedH() { return fusedH[arr(size - 1)]; }
-        Matrix lastCov() { return cov[arr(size - 1)]; }
+        Mat3 lastCov() { return cov[arr(size - 1)]; }
 
         void setFused(int i, double x, double y, double h) { int p = arr(i); fusedX[p] = x; fusedY[p] = y; fusedH[p] = h; }
         void setOdom(int i, double x, double y, double h) { int p = arr(i); odomX[p] = x; odomY[p] = y; odomH[p] = h; }
-        void setCov(int i, Matrix c) { cov[arr(i)] = c; }
+        void setCov(int i, Mat3 c) { cov[arr(i)] = c; }
 
         /** Array index backing logical index {@code i} (0 == oldest). */
         private int arr(int i) { return (head + i) % capacity; }
@@ -461,14 +538,14 @@ public class PoseFusion {
         }
 
         /** Appends a strictly-newer sample at the back; evicts the oldest if somehow at capacity. */
-        void append(long t, double x, double y, double h, double ox, double oy, double oh, Matrix c) {
+        void append(long t, double x, double y, double h, double ox, double oy, double oh, Mat3 c) {
             if (size == capacity) evictOldest();
             store(arr(size), t, x, y, h, ox, oy, oh, c);
             size++;
         }
 
         /** Inserts or fully overwrites a sample, keeping the buffer time-sorted. */
-        void put(long t, double x, double y, double h, double ox, double oy, double oh, Matrix c) {
+        void put(long t, double x, double y, double h, double ox, double oy, double oh, Mat3 c) {
             int fi = floorIndex(t);
             if (fi >= 0 && timeAt(fi) == t) {
                 store(arr(fi), t, x, y, h, ox, oy, oh, c);
@@ -481,7 +558,7 @@ public class PoseFusion {
          * Applies a vision correction at {@code t}: overwrites fused + covariance if a sample already
          * exists there (leaving its odometry pose), otherwise inserts a new full row.
          */
-        void putCorrection(long t, double x, double y, double h, double ox, double oy, double oh, Matrix c) {
+        void putCorrection(long t, double x, double y, double h, double ox, double oy, double oh, Mat3 c) {
             int fi = floorIndex(t);
             if (fi >= 0 && timeAt(fi) == t) {
                 int p = arr(fi);
@@ -557,7 +634,7 @@ public class PoseFusion {
         }
 
         /** Writes a full row's columns at array index {@code p} (does not touch size/head). */
-        private void store(int p, long t, double x, double y, double h, double ox, double oy, double oh, Matrix c) {
+        private void store(int p, long t, double x, double y, double h, double ox, double oy, double oh, Mat3 c) {
             time[p] = t;
             fusedX[p] = x; fusedY[p] = y; fusedH[p] = h;
             odomX[p] = ox; odomY[p] = oy; odomH[p] = oh;
@@ -570,7 +647,7 @@ public class PoseFusion {
          * always room for the new row without disturbing the logical indices.
          */
         private void insertAt(int pos, long t, double x, double y, double h,
-                              double ox, double oy, double oh, Matrix c) {
+                              double ox, double oy, double oh, Mat3 c) {
             for (int i = size; i > pos; i--) {
                 int dst = arr(i), src = arr(i - 1);
                 store(dst, time[src], fusedX[src], fusedY[src], fusedH[src], odomX[src], odomY[src], odomH[src], cov[src]);

@@ -35,6 +35,7 @@ public class FusionLocalizer implements Localizer {
                 new double[]{processVariance.getX(), processVariance.getY(), processVariance.getHeading()},
                 new double[]{measurementVariance.getX(), measurementVariance.getY(), measurementVariance.getHeading()},
                 bufferSize);
+        setGlitchBounds(80.0, 4.0 * Math.PI);
     }
 
     /**
